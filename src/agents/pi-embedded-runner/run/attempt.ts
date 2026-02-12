@@ -4,6 +4,7 @@ import { streamSimple } from "@mariozechner/pi-ai";
 import { createAgentSession, SessionManager, SettingsManager } from "@mariozechner/pi-coding-agent";
 import fs from "node:fs/promises";
 import os from "node:os";
+import path from "node:path";
 import type { EmbeddedRunAttemptParams, EmbeddedRunAttemptResult } from "./types.js";
 import { resolveHeartbeatPrompt } from "../../../auto-reply/heartbeat.js";
 import { resolveChannelCapabilities } from "../../../config/channel-capabilities.js";
@@ -628,6 +629,204 @@ export async function runEmbeddedAttempt(
         });
       };
 
+      // Initialize logging directory
+      const safeSessionKey = (params.sessionKey || params.sessionId || "unknown").replace(
+        /[^a-zA-Z0-9-_]/g,
+        "_",
+      );
+      const logDir = path.join(
+        params.workspaceDir,
+        "cj_logs",
+        `llm_${safeSessionKey}_${params.runId}`,
+      );
+      await fs.mkdir(logDir, { recursive: true });
+
+      let callIndex = 0;
+      // Store tool calls and results for the current call
+      const currentCallTools = new Map<
+        string,
+        { name: string; args?: unknown; result?: unknown }
+      >();
+
+      const appendToLogFile = async (index: number, content: string) => {
+        const filePath = path.join(logDir, `call_${index.toString().padStart(4, "0")}.jsonl`);
+        try {
+          await fs.appendFile(filePath, content + "\n", "utf8");
+        } catch (e) {
+          console.error(`[LLM_LOG] Failed to append to ${filePath}:`, e);
+        }
+      };
+
+      const writeCallLog = async (index: number) => {
+        const lines: string[] = [];
+        lines.push(`========== LLM CALL #${index} ==========`);
+        lines.push(`Timestamp: ${new Date().toISOString()}`);
+        lines.push(``);
+
+        // --- REQUEST SECTION ---
+        lines.push(`--- REQUEST ---`);
+        lines.push(``);
+        lines.push(`System Prompt:`);
+        lines.push(systemPromptText ?? "[No system prompt]");
+        lines.push(``);
+        lines.push(`Tools Schema:`);
+        try {
+          lines.push(JSON.stringify(allCustomTools, null, 2));
+        } catch {
+          lines.push("[Tools too large to stringify]");
+        }
+        lines.push(``);
+        lines.push(`Messages:`);
+        try {
+          const messages = activeSession.messages;
+          lines.push(`Total: ${messages.length} messages`);
+          lines.push(``);
+          for (let i = 0; i < messages.length; i++) {
+            const msg = messages[i] as unknown as Record<string, unknown>;
+            const role = (msg.role as string) || "unknown";
+            let content = "";
+            if (Array.isArray(msg.content)) {
+              const parts: string[] = [];
+              for (const c of msg.content) {
+                const cObj = c as Record<string, unknown>;
+                if (cObj.type === "text" && typeof cObj.text === "string") {
+                  parts.push(cObj.text);
+                } else if (cObj.type === "tool_use" && cObj.id) {
+                  const toolCallId = cObj.id as string;
+                  const toolName = (cObj.name as string) || "unknown";
+                  const toolArgs = JSON.stringify(cObj.input || cObj.arguments || {});
+                  parts.push(`[TOOL_CALL: ${toolName} (${toolCallId})]`);
+                  parts.push(`Arguments: ${toolArgs}`);
+                  // Store for later
+                  currentCallTools.set(toolCallId, {
+                    name: toolName,
+                    args: cObj.input || cObj.arguments,
+                  });
+                } else if (cObj.type === "tool_result" && cObj.tool_use_id) {
+                  parts.push(`[TOOL_RESULT: ${cObj.tool_use_id}]`);
+                } else {
+                  parts.push(JSON.stringify(c));
+                }
+              }
+              content = parts.join("\n");
+            } else if (typeof msg.content === "string") {
+              content = msg.content;
+            } else if (typeof msg.content === "object" && msg.content !== null) {
+              content = JSON.stringify(msg.content);
+            }
+            lines.push(`  [${role}]:`);
+            lines.push(
+              content
+                .split("\n")
+                .map((l) => `    ${l}`)
+                .join("\n"),
+            );
+            lines.push(``);
+          }
+        } catch (e) {
+          lines.push(`  [Error reading messages] ${String(e)}`);
+        }
+        lines.push(`--- END REQUEST ---`);
+        lines.push(``);
+
+        // --- TOOL EXECUTION SECTION (if any tools were called) ---
+        if (currentCallTools.size > 0) {
+          lines.push(`--- TOOL EXECUTION ---`);
+          lines.push(``);
+          for (const [toolCallId, tool] of currentCallTools) {
+            lines.push(`Tool: ${tool.name} (${toolCallId})`);
+            if (tool.args) {
+              lines.push(`Arguments:`);
+              try {
+                lines.push(
+                  JSON.stringify(tool.args, null, 2)
+                    .split("\n")
+                    .map((l) => `  ${l}`)
+                    .join("\n"),
+                );
+              } catch {
+                lines.push(`  ${String(tool.args)}`);
+              }
+            }
+            if (tool.result !== undefined) {
+              lines.push(`Result:`);
+              try {
+                const resultStr =
+                  typeof tool.result === "string"
+                    ? tool.result
+                    : JSON.stringify(tool.result, null, 2);
+                lines.push(
+                  resultStr
+                    .split("\n")
+                    .map((l) => `  ${l}`)
+                    .join("\n"),
+                );
+              } catch {
+                lines.push(`  ${String(tool.result)}`);
+              }
+            } else {
+              lines.push(`Result: [Pending or not recorded]`);
+            }
+            lines.push(``);
+          }
+          lines.push(`--- END TOOL EXECUTION ---`);
+          lines.push(``);
+        }
+
+        // Write the file
+        const filePath = path.join(logDir, `call_${index.toString().padStart(4, "0")}.jsonl`);
+        await fs.writeFile(filePath, lines.join("\n") + "\n", "utf8");
+        console.error(`[LLM_LOG] Call #${index} log written`);
+      };
+
+      const wrappedOnAssistantMessageStart = () => {
+        callIndex++;
+        console.error(`[LLM_LOG] Call #${callIndex} started`);
+        // Clear tools for new call
+        currentCallTools.clear();
+
+        // Write initial log (will be updated with output later)
+        void writeCallLog(callIndex);
+
+        params.onAssistantMessageStart?.();
+      };
+
+      const wrappedOnBlockReply = (payload: { text?: string; mediaUrls?: string[] }) => {
+        console.error(`[LLM_LOG] Call #${callIndex} output received, hasText=${!!payload.text}`);
+        if (payload.text) {
+          const outputLines = [
+            `--- RESPONSE ---`,
+            ``,
+            payload.text,
+            ``,
+            `--- END RESPONSE ---`,
+            ``,
+          ];
+          void appendToLogFile(callIndex, outputLines.join("\n"));
+        }
+        params.onBlockReply?.(payload);
+      };
+
+      const wrappedOnAgentEvent = (event: { stream: string; data: Record<string, unknown> }) => {
+        if (event.stream === "tool") {
+          const data = event.data;
+          const phase = data.phase as string;
+          const name = data.name as string;
+          const toolCallId = data.toolCallId as string;
+
+          if (phase === "result") {
+            // Store tool result
+            const existingTool = currentCallTools.get(toolCallId);
+            if (existingTool) {
+              existingTool.result = data.result;
+            } else {
+              currentCallTools.set(toolCallId, { name, result: data.result });
+            }
+          }
+        }
+        params.onAgentEvent?.(event);
+      };
+
       const subscription = subscribeEmbeddedPiSession({
         session: activeSession,
         runId: params.runId,
@@ -638,13 +837,13 @@ export async function runEmbeddedAttempt(
         shouldEmitToolOutput: params.shouldEmitToolOutput,
         onToolResult: params.onToolResult,
         onReasoningStream: params.onReasoningStream,
-        onBlockReply: params.onBlockReply,
+        onBlockReply: wrappedOnBlockReply,
         onBlockReplyFlush: params.onBlockReplyFlush,
         blockReplyBreak: params.blockReplyBreak,
         blockReplyChunking: params.blockReplyChunking,
         onPartialReply: params.onPartialReply,
-        onAssistantMessageStart: params.onAssistantMessageStart,
-        onAgentEvent: params.onAgentEvent,
+        onAssistantMessageStart: wrappedOnAssistantMessageStart,
+        onAgentEvent: wrappedOnAgentEvent,
         enforceFinalTag: params.enforceFinalTag,
       });
 
